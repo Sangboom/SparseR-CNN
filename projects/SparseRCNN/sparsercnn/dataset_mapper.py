@@ -72,6 +72,8 @@ class SparseRCNNDatasetMapper:
 
         self.img_format = cfg.INPUT.FORMAT
         self.is_train = is_train
+        self.use_instance_mask = cfg.MODEL.MASK_ON
+        self.instance_mask_format = cfg.INPUT.MASK_FORMAT
 
     def __call__(self, dataset_dict):
         """
@@ -110,7 +112,9 @@ class SparseRCNNDatasetMapper:
         if "annotations" in dataset_dict:
             # USER: Modify this if you want to keep them for some reason.
             for anno in dataset_dict["annotations"]:
-                anno.pop("segmentation", None)
+                if not self.use_instance_mask:
+                    anno.pop("segmentation", None)
+                # if not self.use_keypoint:
                 anno.pop("keypoints", None)
 
             # USER: Implement additional transformations if you have other types of data
@@ -119,6 +123,6 @@ class SparseRCNNDatasetMapper:
                 for obj in dataset_dict.pop("annotations")
                 if obj.get("iscrowd", 0) == 0
             ]
-            instances = utils.annotations_to_instances(annos, image_shape)
+            instances = utils.annotations_to_instances(annos, image_shape, mask_format=self.instance_mask_format)
             dataset_dict["instances"] = utils.filter_empty_instances(instances)
         return dataset_dict

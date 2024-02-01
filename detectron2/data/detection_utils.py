@@ -415,6 +415,8 @@ def annotations_to_instances(annos, image_size, mask_format="polygon"):
                 torch.stack([torch.from_numpy(np.ascontiguousarray(x)) for x in masks])
             )
         target.gt_masks = masks
+    else:
+        target.gt_masks = PolygonMasks([])
 
     if len(annos) and "keypoints" in annos[0]:
         kpts = [obj.get("keypoints", []) for obj in annos]

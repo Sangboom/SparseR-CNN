@@ -62,7 +62,8 @@ def mask_rcnn_loss(pred_mask_logits: torch.Tensor, instances: List[Instances], v
             gt_classes.append(gt_classes_per_image)
 
         gt_masks_per_image = instances_per_image.gt_masks.crop_and_resize(
-            instances_per_image.proposal_boxes.tensor, mask_side_len
+            # instances_per_image.proposal_boxes.tensor, mask_side_len
+            instances_per_image.pred_boxes.tensor.detach(), mask_side_len
         ).to(device=pred_mask_logits.device)
         # A tensor of shape (N, M, M), N=#instances in the image; M=mask_side_len
         gt_masks.append(gt_masks_per_image)
@@ -281,6 +282,30 @@ class MaskRCNNConvUpsampleHead(BaseMaskRCNNHead, nn.Sequential):
             x = layer(x)
         return x
 
+    def forward(self, x, instances: List[Instances]):
+        """
+        Args:
+            x: input region feature(s) provided by :class:`ROIHeads`.
+            instances (list[Instances]): contains the boxes & labels corresponding
+                to the input features.
+                Exact format is up to its caller to decide.
+                Typically, this is the foreground instances in training, with
+                "proposal_boxes" field and other gt annotations.
+                In inference, it contains boxes that are already predicted.
+
+        Returns:
+            A dict of losses in training. The predicted "instances" in inference.
+        """
+        
+        
+        x = self.layers(x)
+
+        if self.training:
+            assert not torch.jit.is_scripting()
+            return {"loss_mask": mask_rcnn_loss(x, instances, self.vis_period)}
+        else:
+            mask_rcnn_inference(x, instances)
+            return instances
 
 def build_mask_head(cfg, input_shape):
     """

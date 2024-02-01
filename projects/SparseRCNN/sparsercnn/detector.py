@@ -21,6 +21,12 @@ from detectron2.structures import Boxes, ImageList, Instances
 from detectron2.utils.logger import log_first_n
 from fvcore.nn import giou_loss, smooth_l1_loss
 
+from detectron2.structures import pairwise_iou
+from detectron2.modeling.roi_heads.mask_head import build_mask_head
+from detectron2.modeling.roi_heads.fast_rcnn import FastRCNNOutputs
+from detectron2.modeling.poolers import ROIPooler, cat
+from detectron2.modeling.proposal_generator.proposal_utils import add_ground_truth_to_proposals
+
 from .loss import SetCriterion, HungarianMatcher
 from .head import DynamicHead
 from .util.box_ops import box_cxcywh_to_xyxy, box_xyxy_to_cxcywh
@@ -29,6 +35,59 @@ from .util.misc import (NestedTensor, nested_tensor_from_tensor_list,
                        is_dist_avail_and_initialized)
 
 __all__ = ["SparseRCNN"]
+
+
+def select_foreground_proposals(proposals, bg_label, feat_b2m=None, class_logits=None):
+    """
+    Given a list of N Instances (for N images), each containing a `gt_classes` field,
+    return a list of Instances that contain only instances with `gt_classes != -1 &&
+    gt_classes != bg_label`.
+    Args:
+        proposals (list[Instances]): A list of N Instances, where N is the number of
+            images in the batch.
+        bg_label: label index of background class.
+    Returns:
+        list[Instances]: N Instances, each contains only the selected foreground instances.
+        list[Tensor]: N boolean vector, correspond to the selection mask of
+            each Instances object. True for selected instances.
+    """
+    assert isinstance(proposals, (list, tuple))
+    assert isinstance(proposals[0], Instances)
+    assert proposals[0].has("gt_classes")
+    fg_proposals = []
+    fg_selection_masks = []
+    if feat_b2m == None:
+        feat_b2m_cat = None
+    else:
+        feat_b2m_cat = {}
+    if class_logits == None:
+        class_logits_cat = None
+    for idx, proposals_per_image in enumerate(proposals):
+        gt_classes = proposals_per_image.gt_classes
+        fg_selection_mask = (gt_classes != -1) & (gt_classes != bg_label)
+        fg_idxs = fg_selection_mask.nonzero().squeeze(1)
+        fg_proposals.append(proposals_per_image[fg_idxs])
+        fg_selection_masks.append(fg_selection_mask)
+        if feat_b2m != None:
+            start_idx = int(gt_classes.shape[0] * idx)
+            end_idx = int(gt_classes.shape[0] * (idx + 1))
+            for key in feat_b2m.keys():
+                feat_b2m_per_image = feat_b2m[key][start_idx:end_idx]
+                if idx == 0:
+                    feat_b2m_cat[key] = feat_b2m_per_image[fg_idxs]
+                else:
+                    feat_b2m_cat[key] = torch.cat((feat_b2m_cat[key], feat_b2m_per_image[fg_idxs]), dim=0)
+        if class_logits != None:
+            start_idx = int(gt_classes.shape[0] * idx)
+            end_idx = int(gt_classes.shape[0] * (idx + 1))
+            class_logits_per_image = class_logits[start_idx:end_idx]
+            if idx == 0:
+                class_logits_cat = class_logits_per_image[fg_idxs]
+            else:
+                class_logits_cat = torch.cat((class_logits_cat, class_logits_per_image[fg_idxs]), dim=0)
+    
+    return fg_proposals, fg_selection_masks, feat_b2m_cat, class_logits_cat
+
 
 
 @META_ARCH_REGISTRY.register()
@@ -97,6 +156,36 @@ class SparseRCNN(nn.Module):
         self.normalizer = lambda x: (x - pixel_mean) / pixel_std
         self.to(self.device)
 
+        self.mask_on = cfg.MODEL.MASK_ON
+        if self.mask_on:
+            self.matcher = matcher
+            self._init_mask_head(cfg)
+
+    def _init_mask_head(self, cfg):
+        if not self.mask_on:
+            return
+        self.proposal_append_gt       = cfg.MODEL.ROI_HEADS.PROPOSAL_APPEND_GT
+        self.input_shape = self.backbone.output_shape()
+        self.feature_strides          = {k: v.stride for k, v in self.input_shape.items()}
+        self.feature_channels         = {k: v.channels for k, v in self.input_shape.items()}
+        self.in_features              = cfg.MODEL.ROI_HEADS.IN_FEATURES
+        pooler_resolution = cfg.MODEL.ROI_MASK_HEAD.POOLER_RESOLUTION
+        pooler_scales     = tuple(1.0 / self.feature_strides[k] for k in self.in_features)
+        sampling_ratio    = cfg.MODEL.ROI_MASK_HEAD.POOLER_SAMPLING_RATIO
+        pooler_type       = cfg.MODEL.ROI_MASK_HEAD.POOLER_TYPE
+
+        in_channels = [self.feature_channels[f] for f in self.in_features][0]
+
+        self.mask_pooler = ROIPooler(
+            output_size=pooler_resolution,
+            scales=pooler_scales,
+            sampling_ratio=sampling_ratio,
+            pooler_type=pooler_type,
+        )
+        self.mask_head = build_mask_head(
+            # cfg, ShapeSpec(channels=in_channels, width=pooler_resolution, height=pooler_resolution), self.input_shape
+            cfg, ShapeSpec(channels=in_channels, width=pooler_resolution, height=pooler_resolution)
+        )
 
     def forward(self, batched_inputs, do_postprocess=True):
         """
@@ -145,6 +234,32 @@ class SparseRCNN(nn.Module):
             for k in loss_dict.keys():
                 if k in weight_dict:
                     loss_dict[k] *= weight_dict[k]
+            
+            if self.mask_on:
+                outputs_without_aux = {k: v for k, v in output.items() if k != 'aux_outputs'}
+                # Retrieve the matching between the outputs of the last layer and the targets
+                indices = self.matcher(outputs_without_aux, targets)
+                
+                box_cls = output["pred_logits"]
+                box_pred = output["pred_boxes"]
+                instances = self.inference(box_cls, box_pred, images.image_sizes)
+                
+                mask_instances = []
+                for i, (idx, instance, gt_instance) in enumerate(zip(indices, instances, gt_instances)):
+                    mask_instance = Instances(images.image_sizes)
+                    mask_instance.pred_boxes = instance.pred_boxes[idx[0]]
+                    mask_instance.scores = instance.scores[idx[0]]
+                    mask_instance.pred_classes = instance.pred_classes[idx[0]]
+                    mask_instance.gt_classes = gt_instance.gt_classes[idx[1]]
+                    mask_instance.gt_boxes = gt_instance.gt_boxes[idx[1]]
+                    mask_instance.gt_masks = gt_instance.gt_masks[idx[1]]
+                    mask_instances.append(mask_instance)
+                
+                pred_boxes =[x.pred_boxes for x in mask_instances]
+                x_roi = self.mask_pooler(features, pred_boxes)
+                loss_mask = self.mask_head(x_roi, mask_instances)
+                loss_dict.update(loss_mask)
+
             return loss_dict
 
         else:
@@ -248,3 +363,86 @@ class SparseRCNN(nn.Module):
         images_whwh = torch.stack(images_whwh)
 
         return images, images_whwh
+
+    @torch.no_grad()
+    def label_and_sample_proposals(self, proposals, targets):
+        """
+        Prepare some proposals to be used to train the ROI heads.
+        It performs box matching between `proposals` and `targets`, and assigns
+        training labels to the proposals.
+        It returns ``self.batch_size_per_image`` random samples from proposals and groundtruth
+        boxes, with a fraction of positives that is no larger than
+        ``self.positive_sample_fraction``.
+        Args:
+            See :meth:`ROIHeads.forward`
+        Returns:
+            list[Instances]:
+                length `N` list of `Instances`s containing the proposals
+                sampled for training. Each `Instances` has the following fields:
+                - proposal_boxes: the proposal boxes
+                - gt_boxes: the ground-truth box that the proposal is assigned to
+                  (this is only meaningful if the proposal has a label > 0; if label = 0
+                  then the ground-truth box is random)
+                Other fields such as "gt_classes", "gt_masks", that's included in `targets`.
+        """
+        gt_boxes = [x.gt_boxes for x in targets]
+        # Augment proposals with ground-truth boxes.
+        # In the case of learned proposals (e.g., RPN), when training starts
+        # the proposals will be low quality due to random initialization.
+        # It's possible that none of these initial
+        # proposals have high enough overlap with the gt objects to be used
+        # as positive examples for the second stage components (box head,
+        # cls head, mask head). Adding the gt boxes to the set of proposals
+        # ensures that the second stage components will have some positive
+        # examples from the start of training. For RPN, this augmentation improves
+        # convergence and empirically improves box AP on COCO by about 0.5
+        # points (under one tested configuration).
+        if self.proposal_append_gt:
+            proposals = add_ground_truth_to_proposals(gt_boxes, proposals)
+
+        proposals_with_gt = []
+
+        num_fg_samples = []
+        num_bg_samples = []
+        for proposals_per_image, targets_per_image in zip(proposals, targets):
+            has_gt = len(targets_per_image) > 0
+            match_quality_matrix = pairwise_iou(
+                targets_per_image.gt_boxes, proposals_per_image.proposal_boxes
+            )
+            matched_idxs, matched_labels = self.proposal_matcher(match_quality_matrix)
+            sampled_idxs, gt_classes = self._sample_proposals(
+                matched_idxs, matched_labels, targets_per_image.gt_classes
+            )
+
+            # Set target attributes of the sampled proposals:
+            proposals_per_image = proposals_per_image[sampled_idxs]
+            proposals_per_image.gt_classes = gt_classes
+
+            # We index all the attributes of targets that start with "gt_"
+            # and have not been added to proposals yet (="gt_classes").
+            if has_gt:
+                sampled_targets = matched_idxs[sampled_idxs]
+                # NOTE: here the indexing waste some compute, because heads
+                # like masks, keypoints, etc, will filter the proposals again,
+                # (by foreground/background, or number of keypoints in the image, etc)
+                # so we essentially index the data twice.
+                for (trg_name, trg_value) in targets_per_image.get_fields().items():
+                    if trg_name.startswith("gt_") and not proposals_per_image.has(trg_name):
+                        proposals_per_image.set(trg_name, trg_value[sampled_targets])
+            else:
+                gt_boxes = Boxes(
+                    targets_per_image.gt_boxes.tensor.new_zeros((len(sampled_idxs), 4))
+                )
+                proposals_per_image.gt_boxes = gt_boxes
+
+            num_bg_samples.append((gt_classes == self.num_classes).sum().item())
+            num_fg_samples.append(gt_classes.numel() - num_bg_samples[-1])
+            proposals_with_gt.append(proposals_per_image)
+
+        # Log the number of fg/bg samples that are selected for training ROI heads
+        storage = get_event_storage()
+        storage.put_scalar("roi_head/num_fg_samples", np.mean(num_fg_samples))
+        storage.put_scalar("roi_head/num_bg_samples", np.mean(num_bg_samples))
+
+        return proposals_with_gt
+
