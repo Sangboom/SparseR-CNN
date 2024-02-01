@@ -124,6 +124,7 @@ def setup(args):
     add_sparsercnn_config(cfg)
     cfg.merge_from_file(args.config_file)
     cfg.merge_from_list(args.opts)
+    cfg.OUTPUT_DIR = args.config_file[:-5].replace("configs", "output")
     cfg.freeze()
     default_setup(cfg, args)
     return cfg

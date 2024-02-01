@@ -245,8 +245,8 @@ class SparseRCNN(nn.Module):
                 instances = self.inference(box_cls, box_pred, images.image_sizes)
                 
                 mask_instances = []
-                for i, (idx, instance, gt_instance) in enumerate(zip(indices, instances, gt_instances)):
-                    mask_instance = Instances(images.image_sizes)
+                for i, (idx, instance, gt_instance, image_size) in enumerate(zip(indices, instances, gt_instances, images.image_sizes)):
+                    mask_instance = Instances(image_size)
                     mask_instance.pred_boxes = instance.pred_boxes[idx[0]]
                     mask_instance.scores = instance.scores[idx[0]]
                     mask_instance.pred_classes = instance.pred_classes[idx[0]]
@@ -266,6 +266,21 @@ class SparseRCNN(nn.Module):
             box_cls = output["pred_logits"]
             box_pred = output["pred_boxes"]
             results = self.inference(box_cls, box_pred, images.image_sizes)
+            
+            if self.mask_on:
+                mask_instances = []
+                for (instance, image_size) in zip(results, images.image_sizes):
+                    # fg_idx = torch.where(instance.scores > 0.3)
+                    fg_idx = torch.where(instance.scores > 0.0)
+                    mask_instance = Instances(image_size)
+                    mask_instance.pred_boxes = instance.pred_boxes[fg_idx]
+                    mask_instance.scores = instance.scores[fg_idx]
+                    mask_instance.pred_classes = instance.pred_classes[fg_idx]
+                    mask_instances.append(mask_instance)
+
+                pred_boxes =[x.pred_boxes for x in mask_instances]
+                x_roi = self.mask_pooler(features, pred_boxes)
+                results = self.mask_head(x_roi, mask_instances)
             
             if do_postprocess:
                 processed_results = []
