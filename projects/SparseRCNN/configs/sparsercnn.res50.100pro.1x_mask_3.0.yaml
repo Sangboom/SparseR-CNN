@@ -8,6 +8,7 @@ MODEL:
   SparseRCNN:
     NUM_PROPOSALS: 100
     NUM_CLASSES: 80
+    MASK_WEIGHT: 3.0
 DATASETS:
   TRAIN: ("coco_2017_train",)
   TEST:  ("coco_2017_val",)

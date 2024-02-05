@@ -213,7 +213,7 @@ class MaskRCNNConvUpsampleHead(BaseMaskRCNNHead, nn.Sequential):
     """
 
     @configurable
-    def __init__(self, input_shape: ShapeSpec, *, num_classes, conv_dims, conv_norm="", **kwargs):
+    def __init__(self, input_shape: ShapeSpec, *, num_classes, conv_dims, mask_weight, conv_norm="", **kwargs):
         """
         NOTE: this interface is experimental.
 
@@ -229,6 +229,7 @@ class MaskRCNNConvUpsampleHead(BaseMaskRCNNHead, nn.Sequential):
         assert len(conv_dims) >= 1, "conv_dims have to be non-empty!"
 
         self.conv_norm_relus = []
+        self.mask_weight = mask_weight
 
         cur_channels = input_shape.channels
         for k, conv_dim in enumerate(conv_dims[:-1]):
@@ -275,6 +276,7 @@ class MaskRCNNConvUpsampleHead(BaseMaskRCNNHead, nn.Sequential):
             ret["num_classes"] = 1
         else:
             ret["num_classes"] = cfg.MODEL.ROI_HEADS.NUM_CLASSES
+        ret["mask_weight"] = cfg.MODEL.SparseRCNN.MASK_WEIGHT
         return ret
 
     def layers(self, x):
@@ -302,7 +304,7 @@ class MaskRCNNConvUpsampleHead(BaseMaskRCNNHead, nn.Sequential):
 
         if self.training:
             assert not torch.jit.is_scripting()
-            return {"loss_mask": mask_rcnn_loss(x, instances, self.vis_period)}
+            return {"loss_mask": mask_rcnn_loss(x, instances, self.vis_period) * self.mask_weight}
         else:
             mask_rcnn_inference(x, instances)
             return instances
